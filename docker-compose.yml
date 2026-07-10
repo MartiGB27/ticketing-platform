@@ -1,0 +1,19 @@
+# Phase 1: we only spin up PostgreSQL for local development.
+# In Phase 2 this file will grow with Redis, RabbitMQ and the app containers.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: ticketing_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ticketing
+      POSTGRES_PASSWORD: ticketing_dev_password
+      POSTGRES_DB: ticketing_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - ticketing_pg_data:/var/lib/postgresql/data
+
+volumes:
+  ticketing_pg_data:
