@@ -1,19 +1,109 @@
-# Phase 1: we only spin up PostgreSQL for local development.
-# In Phase 2 this file will grow with Redis, RabbitMQ and the app containers.
-
 services:
   postgres:
     image: postgres:16-alpine
     container_name: ticketing_postgres
     restart: unless-stopped
     environment:
-      POSTGRES_USER: ticketing
-      POSTGRES_PASSWORD: ticketing_dev_password
-      POSTGRES_DB: ticketing_db
+      POSTGRES_USER: ${DB_USER:-ticketing}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-ticketing_dev_password}
+      POSTGRES_DB: ${DB_NAME:-ticketing_db}
     ports:
       - "5432:5432"
     volumes:
       - ticketing_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-ticketing} -d ${DB_NAME:-ticketing_db}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: ticketing_redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    # Not used by any service's code yet — wired up in Phase 3 for the
+    # distributed seat lock (SET key value NX PX 300000).
+
+  users-service:
+    build: ./services/users-service
+    container_name: ticketing_users_service
+    restart: unless-stopped
+    environment:
+      PORT: 3000
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USER: ${DB_USER:-ticketing}
+      DB_PASSWORD: ${DB_PASSWORD:-ticketing_dev_password}
+      DB_NAME: ${DB_NAME:-ticketing_db}
+      JWT_SECRET: ${JWT_SECRET:-change_this_secret_in_production}
+      JWT_EXPIRES_IN: ${JWT_EXPIRES_IN:-1h}
+    ports:
+      - "3001:3000" # host:container — for direct debugging only, see README
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  events-service:
+    build: ./services/events-service
+    container_name: ticketing_events_service
+    restart: unless-stopped
+    environment:
+      PORT: 3000
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USER: ${DB_USER:-ticketing}
+      DB_PASSWORD: ${DB_PASSWORD:-ticketing_dev_password}
+      DB_NAME: ${DB_NAME:-ticketing_db}
+      JWT_SECRET: ${JWT_SECRET:-change_this_secret_in_production}
+    ports:
+      - "3002:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  reservations-service:
+    build: ./services/reservations-service
+    container_name: ticketing_reservations_service
+    restart: unless-stopped
+    environment:
+      PORT: 3000
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USER: ${DB_USER:-ticketing}
+      DB_PASSWORD: ${DB_PASSWORD:-ticketing_dev_password}
+      DB_NAME: ${DB_NAME:-ticketing_db}
+      JWT_SECRET: ${JWT_SECRET:-change_this_secret_in_production}
+    ports:
+      - "3003:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      # Best-effort ordering so the `events` table exists before this
+      # service starts querying it. `service_started` only waits for the
+      # container to start, not for Nest+TypeORM to finish synchronizing —
+      # if you ever see a "relation events does not exist" error on a cold
+      # first start, just run: docker compose restart reservations-service
+      events-service:
+        condition: service_started
+
+  gateway:
+    build: ./gateway
+    container_name: ticketing_gateway
+    restart: unless-stopped
+    environment:
+      PORT: 3000
+      JWT_SECRET: ${JWT_SECRET:-change_this_secret_in_production}
+      USERS_SERVICE_URL: http://users-service:3000
+      EVENTS_SERVICE_URL: http://events-service:3000
+      RESERVATIONS_SERVICE_URL: http://reservations-service:3000
+    ports:
+      - "3000:3000" # same client-facing port as the Phase 1 monolith
+    depends_on:
+      - users-service
+      - events-service
+      - reservations-service
 
 volumes:
   ticketing_pg_data:

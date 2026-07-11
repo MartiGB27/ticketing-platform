@@ -1,108 +1,134 @@
-# Ticketing Platform — Phase 1 (Core)
+# Ticketing Platform — Phase 2 (Dockerization & Separation)
 
-A modular monolith built with NestJS + TypeScript + PostgreSQL. This is the
-starting point of a distributed ticket-booking system: **Users**,
-**Events**, and **Reservations** live in the same process, but organized
-into independent modules so they can be split into separate Docker services
-in Phase 2 without rewriting the business logic.
+The Phase 1 modular monolith has been split into four independently
+deployable pieces: an **API Gateway** and three backend services
+(**Users**, **Events**, **Reservations**), each running in its own Docker
+container. Redis has been added to `docker-compose.yml`, provisioned and
+ready, though no service code uses it yet — that's Phase 3.
 
-## Why this design
-
-- **One module = one future microservice.** `UsersModule`, `EventsModule`,
-  and `ReservationsModule` don't reference each other directly:
-  `ReservationsModule` doesn't import `EventsService` — it queries the
-  `events` table through its own `DataSource` inside the transaction. This
-  simulates the boundary that will exist once each domain has its own
-  database.
-- **`AuthModule` is cross-cutting**: every module that needs to protect
-  routes imports it (`JwtAuthGuard`), the same way an API Gateway will
-  centralize JWT validation for every other service in Phase 2.
-- **Real transactional consistency, not a simulation.**
-  `ReservationsService.create()` uses `SELECT ... FOR UPDATE` (a pessimistic
-  lock) inside a PostgreSQL transaction. Two concurrent requests trying to
-  buy the last available tickets cannot oversell them — you can verify this
-  yourself by firing parallel requests with Postman Runner or `curl` with `&`.
-
-  > This is **not yet** the 5-minute Redis lock from Phase 3. Here, the
-  > "payment" is confirmed instantly. The Redis lock will be used to
-  > *temporarily hold* a ticket without confirming it, which a plain
-  > PostgreSQL lock doesn't handle well (it would keep a transaction open
-  > for 5 minutes, which is terrible for performance).
+From the client's point of view, **nothing changed**: same base URL
+(`http://localhost:3000`), same routes, same request/response shapes. The
+Postman collection from Phase 1 still works unmodified. Everything below
+is about what changed *behind* that URL.
 
 ## Structure
 
 ```
-src/
-  users/          Registration and profile lookup
-  auth/            Login, JWT issuance, guard and Passport strategy
-  events/          Event catalog (public reads, protected writes)
-  reservations/    "Transactional brain": creates reservations with a pessimistic lock
-  common/          Shared decorators and filters (exceptions -> JSON)
-  app.module.ts    Global configuration (ConfigModule + TypeOrmModule)
-  main.ts          Bootstrap, global ValidationPipe, CORS
+ticketing-platform/
+  docker-compose.yml          Orchestrates everything: postgres, redis, 4 app containers
+  .env.example                 Shared secrets used by docker-compose.yml
+  gateway/                     Single entry point (plain Express, not NestJS — see below)
+  services/
+    users-service/             Registration, login, JWT issuance (owns the `users` table)
+    events-service/             Event catalog (owns the `events` table)
+    reservations-service/       Transactional core (owns `reservations`, reads/locks `events`)
+  postman/
+    ticketing.postman_collection.json
 ```
 
-## Data model
+Each service under `services/` is a fully standalone NestJS project — its
+own `package.json`, `node_modules`, `Dockerfile`. There's no shared npm
+package between them yet. For 3 small services, duplicating ~30 lines of
+JWT-verification code across `events-service` and `reservations-service`
+is a deliberate, explicit trade-off: you can read exactly what each
+service does with no indirection. A larger system would extract that into
+a shared internal package.
 
-| Table           | Key fields                                                      |
-|------------------|-------------------------------------------------------------------|
-| `users`          | `email` (unique), `passwordHash` (bcryptjs, never returned by the API) |
-| `events`         | `totalTickets`, `availableTickets`, `price`                        |
-| `reservations`   | `userId`, `eventId`, `quantity`, `status`, `totalPrice`             |
+## Architecture decisions worth knowing for an interview
 
-Reservation `status`: `pending` (not used yet until Phase 3) →
-`confirmed` (assigned on creation, since payment is simulated) →
-`cancelled` (reserved for when we implement lock expiration).
+**1. The Gateway is intentionally thin — plain Express, not NestJS.**
+Its whole job is: route by path prefix, and reject obviously-bad JWTs
+before wasting a network hop. Pulling in all of Nest for that would be
+overkill. See `gateway/src/main.ts` and `gateway/src/routes.ts`.
 
-## Getting started
+**2. JWT validation is layered (defense in depth), not gateway-only.**
+The Gateway does a *fail-fast* check: if an `Authorization` header is
+present, it verifies the signature and expiry immediately and rejects
+with 401 before proxying if it's invalid. It does **not** decide which
+routes need auth — that stays with each service's own `JwtAuthGuard`,
+exactly like Phase 1. Proven in testing: hitting `events-service` directly
+on its own port, completely bypassing the Gateway, still returns 401 for
+protected routes without a valid token.
 
-### 1. Start PostgreSQL
+**3. Events and Reservations verify JWTs statelessly — no DB lookup.**
+In the monolith, `JwtStrategy.validate()` looked the user up via
+`UsersService`. Now that Users lives in a different service (with its own
+database in the general case), Events/Reservations can't do that lookup
+— and shouldn't, since reaching into another service's database defeats
+the point of separating them. They now trust the signed JWT payload
+directly. Trade-off: if `users-service` needed to revoke a token before
+it expires, Events/Reservations wouldn't know until the token's own
+expiry. Only `users-service` and the Gateway hold `JWT_SECRET` for signing
+purposes; Events/Reservations only need it to verify.
 
-```bash
-docker compose up -d
-```
+**4. Reservations still reads/writes the `events` table directly.**
+`reservations-service` has its own trimmed `EventRef` entity mapped to
+the same physical `events` table, decorated with
+`@Entity('events', { synchronize: false })` so it can run the exact same
+`SELECT ... FOR UPDATE` pessimistic-lock transaction as Phase 1 — without
+ever being allowed to alter a table it doesn't own the schema of. This
+only works because both services still point at the same Postgres
+instance for now. True database-per-service would mean solving
+cross-service ticket-availability coordination some other way — which is
+exactly what Phase 3's Redis distributed lock introduces. We're
+deliberately not solving that problem twice.
 
-This spins up only Postgres (user `ticketing` / password
-`ticketing_dev_password` / database `ticketing_db`). In Phase 2 this file
-will grow to include Redis, RabbitMQ, and the app containers.
+## Running it
 
-### 2. Configure environment variables
+### 1. Configure secrets
 
 ```bash
 cp .env.example .env
 ```
 
-The default values already match `docker-compose.yml`.
-
-### 3. Install dependencies and start the app
+### 2. Build and start everything
 
 ```bash
-npm install
-npm run start:dev
+docker compose up --build
 ```
 
-The server listens on `http://localhost:3000`. With `synchronize: true`
-(development only) TypeORM automatically creates the tables the first time
-it starts.
+First run will take a bit longer (building 4 images). Subsequent runs are
+fast unless you change a `Dockerfile` or dependencies.
 
-### 4. Test with Postman
+> **If you're moving to Phase 2 in the same Postgres volume you used for
+> Phase 1:** the `reservations` table's shape changed slightly (no more
+> foreign-key relations, see below), and `synchronize: true` can fail to
+> auto-migrate an existing table with existing rows. If `reservations-service`
+> fails to start with a column/constraint error, run:
+> ```bash
+> docker compose down -v
+> docker compose up --build
+> ```
+> This wipes the Postgres volume and lets every service create its schema
+> fresh. You'll lose any test data from Phase 1, which is expected — this
+> is exactly what a fresh Phase 2 deployment would do anyway.
 
-Import `postman/ticketing.postman_collection.json`. The collection
-automatically saves the `accessToken` after login and the `eventId` after
-creating an event, so you can run the requests in order without
-copy-pasting anything by hand:
+### 3. Test with Postman
 
-1. `Users -> Register`
-2. `Auth -> Login`
-3. `Events -> Create event`
-4. `Events -> List all events` (public, no token needed)
-5. `Reservations -> Create reservation`
-6. `Reservations -> My reservations`
+Import `postman/ticketing.postman_collection.json`. Same flow as Phase 1:
+`Register → Login → Create event → Create reservation`. A `Gateway →
+Health check` request has been added.
 
-### 5. Test concurrency (optional, but the most interesting part)
+### 4. Verify service separation for yourself
 
-Create an event with `totalTickets: 2` and fire 3 parallel reservation
-requests from the terminal:
+Each backend service is also reachable directly on its host-mapped port,
+for debugging:
+
+| Service               | Via Gateway (client-facing) | Direct (debugging only) |
+|------------------------|------------------------------|---------------------------|
+| Gateway                | `http://localhost:3000`     | — |
+| users-service          | `http://localhost:3000/users`, `/auth` | `http://localhost:3001` |
+| events-service         | `http://localhost:3000/events` | `http://localhost:3002` |
+| reservations-service   | `http://localhost:3000/reservations` | `http://localhost:3003` |
+
+Try hitting `http://localhost:3002/events` (POST, no token) directly —
+you'll still get a 401 from `events-service`'s own guard, proving it
+doesn't blindly trust the Gateway.
+
+### 5. Re-run the concurrency test from Phase 1
+
+Same test, same expected result — now proving the pessimistic lock still
+holds with `reservations-service` running as a fully separate container:
 
 ```bash
 TOKEN="your_token"
@@ -117,40 +143,28 @@ done
 wait
 ```
 
-Expected result: 2 `confirmed` reservations and 1 error 400 saying no
-tickets are left. `availableTickets` ends up at `0`, never negative.
+### Running a single service standalone (fast iteration)
 
-## Available routes
+You don't need to rebuild all of Docker Compose to iterate on one
+service. Each one has its own `.env.example` for running outside Docker:
 
-| Method | Route                 | Protected | Description                          |
-|--------|------------------------|-----------|----------------------------------------|
-| POST   | `/users/register`     | No        | Creates a new user                     |
-| GET    | `/users/:id`          | No        | Looks up a user                        |
-| POST   | `/auth/login`         | No        | Returns a JWT                          |
-| GET    | `/auth/me`            | Yes       | Returns the user from the token        |
-| POST   | `/events`             | Yes       | Creates an event                       |
-| GET    | `/events`             | No        | Lists the catalog                      |
-| GET    | `/events/:id`         | No        | Event detail                           |
-| POST   | `/reservations`       | Yes       | Creates a reservation (lock + "payment") |
-| GET    | `/reservations`       | Yes       | Reservations for the authenticated user |
-| GET    | `/reservations/:id`   | Yes       | Reservation detail                     |
+```bash
+cd services/events-service
+cp .env.example .env   # DB_HOST=localhost, points at the Dockerized Postgres via its host port
+npm install
+npm run start:dev
+```
 
-## What's left for future phases (not a bug, it's the plan)
+## What's left for future phases
 
-- **Phase 2**: split `users`, `events`, and `reservations` into independent
-  Docker containers, each with its own `Dockerfile`, and add Redis to
-  `docker-compose.yml`.
-- **Phase 3**: replace the instant confirmation in `ReservationsService`
-  with a `pending` flow backed by a Redis lock (`SET key value NX PX
-  300000`), RabbitMQ to notify the notifications service, and an
-  idempotency table/key for the payment endpoint.
-- **Phase 4**: structured JSON logging, an exported Postman collection
-  (already included here as a starting point), and a full architecture
-  diagram.
+- **Phase 3**: Redis-based distributed lock for the 5-minute seat hold,
+  RabbitMQ + a Notifications service, real idempotency on the payment
+  endpoint.
+- **Phase 4**: structured JSON logging, exported Postman collection
+  (already here), full architecture diagram.
 
 ## Project roadmap
 
 This repository evolves on a single `main` branch. Each completed phase is
-marked with a Git tag (and a matching GitHub Release with notes) instead of
-being duplicated into folders — check the **Releases** page of this repo to
-browse the state of the project at the end of each phase.
+marked with a Git tag and a matching GitHub Release — check the
+**Releases** page to browse the code as it stood at the end of each phase.

@@ -1,7 +1,7 @@
 {
   "info": {
     "name": "Ticketing Platform",
-    "description": "Collection to test Users, Auth, Events and Reservations. Import it and set the {{baseUrl}} variable to http://localhost:3000",
+    "description": "Collection to test Users, Auth, Events and Reservations through the API Gateway (single entry point at {{baseUrl}}). Every request still targets http://localhost:3000 — same as Phase 1 — the Gateway now transparently routes each one to the users-service, events-service, or reservations-service container behind it.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "variable": [
@@ -11,6 +11,18 @@
     { "key": "reservationId", "value": "" }
   ],
   "item": [
+    {
+      "name": "Gateway",
+      "item": [
+        {
+          "name": "Health check",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/health"
+          }
+        }
+      ]
+    },
     {
       "name": "Users",
       "item": [
