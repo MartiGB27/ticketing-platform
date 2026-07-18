@@ -44,6 +44,13 @@ export class Reservation {
   @Column({ name: 'total_price', type: 'decimal', precision: 10, scale: 2 })
   totalPrice: string;
 
+  // When the 5-minute hold on this PENDING reservation runs out. Checked
+  // explicitly at confirm-time (in case cleanup hasn't caught up yet) and
+  // used by the backup sweeper to find holds to release even if the
+  // Redis expiry notification was missed.
+  @Column({ name: 'expires_at', type: 'timestamptz' })
+  expiresAt: Date;
+
   @CreateDateColumn({ name: 'created_at' })
   createdAt: Date;
 }

@@ -132,7 +132,7 @@
       "name": "Reservations",
       "item": [
         {
-          "name": "Create reservation",
+          "name": "Create reservation (PENDING, 5-min hold)",
           "event": [
             {
               "listen": "test",
@@ -155,6 +155,21 @@
               "mode": "raw",
               "raw": "{\n  \"eventId\": \"{{eventId}}\",\n  \"quantity\": 2\n}"
             }
+          }
+        },
+        {
+          "name": "Confirm reservation (simulated payment)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{accessToken}}" },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{$guid}}",
+                "description": "A fresh GUID is generated per send. Re-sending the exact same key (paste a fixed value here twice in a row) returns the original cached result instead of reprocessing — that's the double-click protection."
+              }
+            ],
+            "url": "{{baseUrl}}/reservations/{{reservationId}}/confirm"
           }
         },
         {

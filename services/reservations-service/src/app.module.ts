@@ -1,9 +1,11 @@
 import { Module } from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { TypeOrmModule } from '@nestjs/typeorm';
+import { ScheduleModule } from '@nestjs/schedule';
 import { ReservationsModule } from './reservations/reservations.module';
 import { Reservation } from './reservations/entities/reservation.entity';
 import { EventRef } from './reservations/entities/event-ref.entity';
+import { RedisModule } from './redis/redis.module';
 
 @Module({
   imports: [
@@ -11,6 +13,8 @@ import { EventRef } from './reservations/entities/event-ref.entity';
       isGlobal: true,
       envFilePath: '.env',
     }),
+    ScheduleModule.forRoot(), // powers the @Interval() backup sweeper
+    RedisModule,
     TypeOrmModule.forRootAsync({
       imports: [ConfigModule],
       inject: [ConfigService],

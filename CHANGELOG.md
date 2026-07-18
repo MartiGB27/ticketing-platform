@@ -90,8 +90,83 @@ each running in its own Docker container.
 
 ---
 
-## [Unreleased] - Phase 3 (planned)
+## [Phase 3] - Queues & Concurrency
 
-- Redis-based distributed lock for the 5-minute seat hold.
-- RabbitMQ + a Notifications service (async, queue-driven).
-- Real idempotency on the payment/reservation endpoint.
+Redis and RabbitMQ go from provisioned-but-unused to load-bearing.
+
+### Added
+- **5-minute seat hold**: `POST /reservations` now creates a `PENDING`
+  reservation with a matching Redis key (`hold:reservation:{id}`, TTL
+  300s) instead of confirming instantly.
+- **`POST /reservations/:id/confirm`**: simulates payment. Requires an
+  `Idempotency-Key` header (modeled on Stripe's convention); rejects with
+  400 if missing.
+- **`ReservationLockService`**: creates/clears the Redis hold key and
+  contains the single, idempotent `revertIfStillPending()` used by both
+  release mechanisms below.
+- **`ReservationExpirySubscriber`**: reactive release via Redis keyspace
+  notifications (`notify-keyspace-events Ex`), subscribed to
+  `__keyevent@0__:expired`.
+- **`ReservationExpirySweeper`**: backup release via a 60-second
+  `@Interval()` sweep over Postgres, independent of Redis — covers the
+  case where a keyspace notification is fired while no subscriber is
+  connected (fire-and-forget pub/sub, not queued/replayed by Redis).
+- **`IdempotencyService`**: generic Redis-backed claim/cache/release
+  helper, reused for the confirm endpoint's idempotency guarantee.
+- **`EventRef` extended** with `name`, `venue`, `eventDate` so
+  reservations-service can build a fully self-contained notification
+  message without an HTTP call to events-service.
+- **notifications-service** (new, 5th service): pure RabbitMQ consumer
+  bootstrapped via `NestFactory.createMicroservice()` — no HTTP port at
+  all. Listens on `reservations_events_queue`, handles
+  `reservation.confirmed` via `@EventPattern`, manually acks only after
+  a successful send (nacks + requeues on failure).
+- **Email delivery**: `ResendEmailProvider` (real, via Resend's HTTP API)
+  and `ConsoleEmailProvider` (dry-run, logs instead of sending) behind a
+  shared `EmailProvider` interface — picked automatically based on
+  whether `RESEND_API_KEY` is set.
+- `rabbitmq` service added to `docker-compose.yml` (management UI on
+  `15672`), `redis` now runs with keyspace notifications enabled and has
+  a healthcheck.
+- Reservation entity gained an `expires_at` column.
+
+### Changed
+- `ReservationsService.create()` no longer confirms instantly — see
+  "Added" above. The pessimistic-lock Postgres transaction itself is
+  unchanged from Phases 1-2.
+
+### Verified (real integration testing, not just unit-level)
+- Full hold → confirm → RabbitMQ → notifications-service → dry-run email
+  flow, end to end.
+- Idempotency, all three cases with real concurrent `curl` requests:
+  fresh key (processes normally), same key replayed after completion
+  (returns cached result, zero reprocessing — confirmed via consumer log
+  count), same key sent twice *simultaneously* (one gets 201, the other
+  409).
+- Ownership check: a second user attempting to confirm someone else's
+  reservation gets 403.
+- Confirming an already-expired hold is rejected (400) even if cleanup
+  hasn't run yet — explicit `expiresAt` check in `doConfirm()`.
+- **Reactive expiry**: created a hold, left it unconfirmed, watched
+  `ReservationExpirySubscriber` release it within ~1s of the TTL firing,
+  ticket count restored.
+- **Backup sweep, specifically the failure case it exists for**: created
+  a hold, killed reservations-service *before* the Redis key expired (so
+  the subscriber couldn't react), confirmed the key expired from Redis
+  while Postgres still said `PENDING` (proving the notification was
+  genuinely missed), restarted the service, and watched
+  `ReservationExpirySweeper` catch and revert it on its next pass.
+
+### Known limitations (by design — addressed in later phases)
+- No structured JSON logging yet — still default Nest console logging.
+- **Real email delivery via Resend**: confirmed against a live account —
+  `ResendEmailProvider`'s HTTP call succeeds and the confirmation email
+  actually arrives in the recipient's inbox, not just the dry-run path.
+
+---
+
+## [Unreleased] - Phase 4 (planned)
+
+- Structured JSON logging across all 5 services.
+- Full architecture diagram.
+- Exported Postman collection (already tracked here each phase).

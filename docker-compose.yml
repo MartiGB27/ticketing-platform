@@ -21,10 +21,33 @@ services:
     image: redis:7-alpine
     container_name: ticketing_redis
     restart: unless-stopped
+    # `--notify-keyspace-events Ex` is what makes Redis publish a pub/sub
+    # event when a key expires (E = keyevent notifications, x = expired
+    # events specifically). ReservationExpirySubscriber in
+    # reservations-service listens for these to release an unpaid
+    # 5-minute hold in real time. Without this flag, keys still expire
+    # normally, but nothing gets notified about it.
+    command: redis-server --notify-keyspace-events Ex
     ports:
       - "6379:6379"
-    # Not used by any service's code yet — wired up in Phase 3 for the
-    # distributed seat lock (SET key value NX PX 300000).
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: ticketing_rabbitmq
+    restart: unless-stopped
+    ports:
+      - "5672:5672"   # AMQP protocol port, used by the services
+      - "15672:15672" # Management UI: http://localhost:15672 (guest/guest)
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
 
   users-service:
     build: ./services/users-service
@@ -75,10 +98,17 @@ services:
       DB_PASSWORD: ${DB_PASSWORD:-ticketing_dev_password}
       DB_NAME: ${DB_NAME:-ticketing_db}
       JWT_SECRET: ${JWT_SECRET:-change_this_secret_in_production}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      RABBITMQ_URL: amqp://rabbitmq:5672
     ports:
       - "3003:3000"
     depends_on:
       postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
         condition: service_healthy
       # Best-effort ordering so the `events` table exists before this
       # service starts querying it. `service_started` only waits for the
@@ -87,6 +117,20 @@ services:
       # first start, just run: docker compose restart reservations-service
       events-service:
         condition: service_started
+
+  notifications-service:
+    build: ./services/notifications-service
+    container_name: ticketing_notifications_service
+    restart: unless-stopped
+    environment:
+      RABBITMQ_URL: amqp://rabbitmq:5672
+      RESEND_API_KEY: ${RESEND_API_KEY:-}
+      NOTIFICATION_FROM_EMAIL: ${NOTIFICATION_FROM_EMAIL:-onboarding@resend.dev}
+    # No ports at all: this service never listens on HTTP, only connects
+    # outbound to RabbitMQ. Nothing to publish to the host.
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
 
   gateway:
     build: ./gateway
