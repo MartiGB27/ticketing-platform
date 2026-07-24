@@ -1,198 +1,105 @@
-# Ticketing Platform — Phase 3 (Queues & Concurrency)
+# Ticketing Platform — Phase 4 (The Bow)
 
-Redis and RabbitMQ stop being decorative. This phase replaces the
-instant-confirmation reservation flow from Phases 1-2 with a real
-**5-minute seat hold**, adds a fully async **Notifications service**
-(the 5th piece of the architecture — no HTTP endpoints at all), and adds
-**idempotency** to the payment-simulating endpoint.
+The last phase: structured JSON logging across all 5 services, a full
+architecture diagram, and a Postman collection that's been kept current
+since Phase 1. No new features — this phase is about making the system
+you already built legible to someone who didn't build it.
 
-## What changed, at a glance
+![Architecture diagram](docs/architecture.svg)
 
-- `POST /reservations` now creates a **PENDING** hold (not an instant
-  `CONFIRMED`), backed by a real Redis key with a 5-minute TTL.
-- A new `POST /reservations/:id/confirm` endpoint simulates payment.
-  It **requires** an `Idempotency-Key` header — send the same key twice
-  (a double-click, a retried request) and the second call returns the
-  first call's exact result instead of re-running anything.
-- If a hold isn't confirmed within 5 minutes, it's released automatically
-  — the ticket becomes available again and the reservation is marked
-  `CANCELLED`. Two independent mechanisms guarantee this (see below).
-- **notifications-service** (new, 5th service): consumes a
-  `reservation.confirmed` message from RabbitMQ and sends a confirmation
-  email. It has zero HTTP surface — nothing can reach it except messages
-  on the queue, exactly as originally specced.
+## Structured logging
 
-## The 5-minute hold: how it actually works
+Every service now logs JSON, not colored console text. This uses
+[`nestjs-pino`](https://github.com/iamolegga/nestjs-pino) in the four
+NestJS services, and a small hand-rolled JSON logger in the Gateway
+(which is plain Express — pulling in pino for one access-log line per
+request isn't worth a new dependency there).
 
-This is the part worth understanding deeply, since it's the kind of thing
-that comes up directly in interviews.
+**The key design goal was minimal churn**: every service already had
+`new Logger(ClassName.name)` calls scattered across ~15 files
+(`ReservationLockService`, `HttpExceptionFilter`, and so on). None of
+those files changed. Wiring `LoggerModule.forRoot()` into `app.module.ts`
+and `app.useLogger(app.get(Logger))` into `main.ts` is enough — Nest's
+`Logger` class delegates its actual output to whatever the app-wide
+logger is configured to be, so every existing call site gets structured
+JSON for free.
 
-**Creating a hold** (`ReservationsService.create()`): identical
-pessimistic-lock Postgres transaction as Phases 1-2 — `SELECT ... FOR
-UPDATE` on the event row, decrement `availableTickets`, done. What's new:
-the reservation starts as `PENDING` with an `expiresAt` 5 minutes out, and
-right after the transaction commits, a Redis key `hold:reservation:{id}`
-is set with `PX 300000` (5-minute TTL).
-
-**Releasing an unpaid hold** — deliberately backed by *two* independent
-mechanisms, not one:
-
-1. **Reactive (primary): Redis keyspace notifications.** Redis is
-   configured with `notify-keyspace-events Ex`, which makes it publish
-   the key's name to `__keyevent@0__:expired` the moment a key expires.
-   `ReservationExpirySubscriber` listens for that and immediately reverts
-   the reservation (`CANCELLED` + ticket count restored). This is
-   near-instant — release happens within milliseconds of the 5 minutes
-   being up.
-
-2. **Backup (safety net): a 60-second sweep.** Redis pub/sub is
-   fire-and-forget. If no subscriber is connected at the *exact* moment a
-   key expires (e.g. this service is mid-restart), that notification is
-   lost forever — Redis does not queue or replay it. `ReservationExpirySweeper`
-   doesn't depend on Redis at all for its own scheduling: every 60
-   seconds it asks Postgres directly "which `PENDING` reservations are
-   past their `expiresAt`?" and reverts whatever it finds. Worst case, a
-   missed hold takes up to ~60s longer to release — but it always gets
-   released.
-
-Both mechanisms call the exact same `ReservationLockService.revertIfStillPending()`,
-which re-checks the reservation's status before doing anything — so it's
-safe if both somehow fire for the same reservation (whichever runs first
-wins; the second is a no-op).
-
-**This was verified for real, not just written and hoped to work:**
-created a hold, killed `reservations-service` before its Redis key could
-expire (so the pub/sub notification fired into the void), confirmed the
-key was gone from Redis while Postgres still said `PENDING`, restarted
-the service, and watched the sweeper catch it exactly as designed.
-
-## Idempotency, concretely
-
-Modeled after Stripe's `Idempotency-Key` header convention.
-`POST /reservations/:id/confirm` requires it — there's no optional
-fallback, since silently allowing an un-keyed request on a
-payment-simulating endpoint would defeat the point.
-
-- **First request with a given key**: processed normally, and the result
-  is cached in Redis (24h TTL) against that key.
-- **Same key, sent again after the first finished**: returns the exact
-  cached result. No RabbitMQ message is published a second time, no
-  re-processing happens at all.
-- **Same key, sent again *while the first is still processing*** (a
-  genuine race — two near-simultaneous requests): the second gets
-  `409 Conflict` rather than being queued or silently duplicated.
-
-All three cases were tested with real concurrent `curl` requests — see
-`CHANGELOG.md` for the exact scenarios.
-
-## notifications-service: the async piece
-
-Structurally different from the other three backend services: it's
-bootstrapped with `NestFactory.createMicroservice()`, not `.create()` —
-there is no HTTP server, no port, nothing for the Gateway to route to.
-The only way in is a message on the `reservations_events_queue` RabbitMQ
-queue.
-
-- `reservations-service` publishes via `ClientProxy.emit('reservation.confirmed', payload)`
-  — fire-and-forget, no reply expected.
-- `notifications-service` consumes via `@EventPattern('reservation.confirmed')`,
-  with **manual acknowledgment**: the message is only ack'd after the
-  email attempt succeeds. If it throws (e.g. the email API is briefly
-  down), the message is nack'd and requeued — at-least-once delivery, not
-  "fire and hope."
-- The `EventRef` entity in `reservations-service` was extended with
-  `name`/`venue`/`eventDate` so the outgoing message is fully
-  self-contained. notifications-service never calls another service over
-  HTTP to enrich the message — that would reintroduce a synchronous
-  dependency into an otherwise fully decoupled flow.
-
-**Sending real email**: uses [Resend](https://resend.com)'s HTTP API
-directly (no SDK, just `fetch`). If `RESEND_API_KEY` isn't set, it falls
-back to logging exactly what it would have sent — the entire
-RabbitMQ → consume → "send" pipeline is fully testable with zero external
-accounts. To send real email: sign up for a free Resend account, grab an
-API key, set `RESEND_API_KEY` in the root `.env`. **This part hasn't been
-tested with a real Resend account** — that account doesn't exist yet, so
-that's on you to verify once you've signed up.
-
-## Structure additions
-
+```json
+{"level":30,"time":1784713913635,"pid":4273,"hostname":"vm","req":{"id":"ebc7c304-872d-4ef2-8238-cc8dfdf2e740","method":"POST","url":"/reservations/37364e5e.../confirm","headers":{"authorization":"[Redacted]", "...": "..."}},"res":{"statusCode":201},"responseTime":17,"msg":"request completed"}
 ```
-services/
-  notifications-service/     NEW — pure RabbitMQ consumer, zero HTTP
-  reservations-service/
-    src/redis/                NEW — Redis client + subscriber providers
-    src/messaging/             NEW — RabbitMQ ClientProxy registration
-    src/reservations/
-      reservation-lock.service.ts       NEW — hold creation/release logic
-      reservation-expiry.subscriber.ts  NEW — reactive Redis pub/sub listener
-      reservation-expiry.sweeper.ts     NEW — 60s backup sweep
-      idempotency.service.ts            NEW — generic Redis-backed idempotency
-```
+
+**Two things worth calling out specifically:**
+
+1. **Request-id correlation across services.** The Gateway generates an
+   `x-request-id` (or reuses one the client already sent) and forwards it
+   downstream. Each backend service's `pinoHttp.genReqId` picks that same
+   id up from the header instead of generating its own. The result:
+   `grep` any request id across all 5 services' logs and you get the
+   complete cross-service story of that one request — confirmed by
+   actually doing exactly that during testing, not just written and
+   assumed to work.
+
+2. **Redaction.** `redact: ['req.headers.authorization']` in every
+   service's `pinoHttp` config means a JWT never lands in aggregated
+   logs, even though pino-http's automatic request logging captures
+   headers by default. Verified: the header shows up as literally
+   `"[Redacted]"` in every service's logs, every time.
+
+**notifications-service** gets the same `LoggerModule.forRoot()` treatment
+but without `pinoHttp` — it never receives an HTTP request (see Phase 3),
+so there's nothing for pino-http's request-logging middleware to attach
+to. It still gets structured JSON for every existing manual `Logger` call
+(`NotificationsController`, `ConsoleEmailProvider`), confirmed working
+even in a pure `createMicroservice()` context.
+
+## Architecture diagram
+
+`docs/architecture.svg` — self-contained (no dependency on any
+external stylesheet, so it renders correctly wherever you view this
+README) and respects your OS's light/dark mode automatically.
+
+## Postman collection
+
+`postman/ticketing.postman_collection.json` has been kept up to date
+every phase rather than built fresh now — it already covers the full
+flow through Phase 3's `/confirm` endpoint with `Idempotency-Key`.
+Nothing new needed for Phase 4.
 
 ## Running it
 
-```bash
-cp .env.example .env
-docker compose up --build
-```
-
-New in this phase's `docker-compose.yml`:
-- `redis` now runs with `command: redis-server --notify-keyspace-events Ex`
-  and has a healthcheck.
-- `rabbitmq` (new): AMQP on `5672`, management UI at
-  `http://localhost:15672` (guest/guest) — useful for watching the queue
-  fill and drain in real time while testing.
-- `notifications-service` (new): no published ports.
-- `reservations-service` now depends on `redis` and `rabbitmq` being
-  healthy, in addition to `postgres`.
-
-> **Moving from a Phase 2 Postgres volume?** The `reservations` table
-> gained an `expires_at` column. Same advice as last time: if
-> `reservations-service` fails to start with a schema error, run
-> `docker compose down -v && docker compose up --build` to start with a
-> clean volume.
-
-### Testing the full flow
+Same as Phase 3 — nothing about `docker compose up --build` changed.
+Watch any service's logs to see the new format:
 
 ```bash
-TOKEN="..."          # from POST /auth/login
-EVENT_ID="..."       # from POST /events
-
-# 1. Create a hold — note status is "pending", not "confirmed"
-curl -s -X POST http://localhost:3000/reservations \
-  -H "Content-Type: application/json" -H "Authorization: Bearer $TOKEN" \
-  -d "{\"eventId\":\"$EVENT_ID\",\"quantity\":1}"
-# -> copy the returned "id" as RESERVATION_ID
-
-# 2. Confirm within 5 minutes (Idempotency-Key required)
-curl -s -X POST http://localhost:3000/reservations/RESERVATION_ID/confirm \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Idempotency-Key: $(uuidgen)"
-
-# 3. Re-send the EXACT same Idempotency-Key — should return the same
-#    result instantly, no reprocessing
-curl -s -X POST http://localhost:3000/reservations/RESERVATION_ID/confirm \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Idempotency-Key: PASTE_THE_SAME_KEY_FROM_STEP_2"
+docker compose logs -f reservations-service
 ```
 
-To see the 5-minute expiry in action without waiting 5 minutes for a
-demo, watch `docker compose logs -f reservations-service` after creating
-a hold you don't confirm — you'll see `ReservationExpirySubscriber` fire
-right at the 5-minute mark.
+Make a request through the Gateway, copy the `x-request-id` from the
+response headers, and grep for it across every service to see the same
+request's footprint end to end:
 
-Check `http://localhost:15672` (RabbitMQ management UI) to watch
-`reservations_events_queue` while confirming reservations — you'll see
-the message count tick up and back down as notifications-service
-consumes it.
+```bash
+docker compose logs | grep "the-request-id-you-copied"
+```
 
-## What's left for Phase 4
+## The full picture
 
-- Structured JSON logging across all 5 services.
-- Exported Postman collection (already here, kept up to date each phase).
-- Full architecture diagram covering the Gateway, all 4 backend/async
-  services, Postgres, Redis, and RabbitMQ.
+Four phases, one `main` branch, no `phase1/`, `phase2/` folders —
+progress lives in Git tags and GitHub Releases instead (see
+`CHANGELOG.md` for the same story in prose). What started as a single
+NestJS process became:
+
+- An API Gateway that's the only thing a client ever talks to.
+- Three independently deployable HTTP services, two of which verify JWTs
+  statelessly with zero database lookups.
+- A Redis-backed 5-minute seat hold with two independent release
+  mechanisms (reactive pub/sub + a backup sweep), both verified against
+  real failure scenarios, not just the happy path.
+- Stripe-style idempotency on the payment-confirming endpoint, verified
+  against real concurrent requests.
+- A fully async notifications service — zero HTTP surface, real email
+  delivery confirmed against a live Resend account.
+- Structured, correlated JSON logs across all five processes.
 
 ## Project roadmap
 

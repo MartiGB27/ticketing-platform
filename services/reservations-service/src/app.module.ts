@@ -2,6 +2,8 @@ import { Module } from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { ScheduleModule } from '@nestjs/schedule';
+import { LoggerModule } from 'nestjs-pino';
+import { randomUUID } from 'crypto';
 import { ReservationsModule } from './reservations/reservations.module';
 import { Reservation } from './reservations/entities/reservation.entity';
 import { EventRef } from './reservations/entities/event-ref.entity';
@@ -9,6 +11,18 @@ import { RedisModule } from './redis/redis.module';
 
 @Module({
   imports: [
+    LoggerModule.forRoot({
+      pinoHttp: {
+        genReqId: (req: any, res: any) => {
+          const existing = req.headers['x-request-id'];
+          if (existing) return existing;
+          const id = randomUUID();
+          res.setHeader('x-request-id', id);
+          return id;
+        },
+        redact: ['req.headers.authorization'],
+      },
+    }),
     ConfigModule.forRoot({
       isGlobal: true,
       envFilePath: '.env',

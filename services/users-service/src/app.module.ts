@@ -1,12 +1,37 @@
 import { Module } from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { TypeOrmModule } from '@nestjs/typeorm';
+import { LoggerModule } from 'nestjs-pino';
+import { randomUUID } from 'crypto';
 import { UsersModule } from './users/users.module';
 import { AuthModule } from './auth/auth.module';
 import { User } from './users/entities/user.entity';
 
 @Module({
   imports: [
+    // First import on purpose: as early as possible so bootstrap-time
+    // logs also go through pino. See main.ts for the other half of this
+    // (bufferLogs + app.useLogger) — together they replace Nest's
+    // default text logger everywhere, including every existing
+    // `new Logger(ClassName.name)` call already in this codebase,
+    // without touching those call sites.
+    LoggerModule.forRoot({
+      pinoHttp: {
+        // Reuse the request id the Gateway generated/forwarded, so the
+        // same id shows up in this service's logs and the Gateway's for
+        // the same request. Falls back to generating one if this
+        // service is reached directly (bypassing the Gateway).
+        genReqId: (req: any, res: any) => {
+          const existing = req.headers['x-request-id'];
+          if (existing) return existing;
+          const id = randomUUID();
+          res.setHeader('x-request-id', id);
+          return id;
+        },
+        // Never let a JWT leak into aggregated logs.
+        redact: ['req.headers.authorization'],
+      },
+    }),
     ConfigModule.forRoot({
       isGlobal: true,
       envFilePath: '.env',

@@ -1,7 +1,9 @@
 import 'dotenv/config'; // loads .env into process.env before we read it below
 import 'reflect-metadata';
 import { NestFactory } from '@nestjs/core';
+import { Logger as NestLogger } from '@nestjs/common';
 import { MicroserviceOptions, Transport } from '@nestjs/microservices';
+import { Logger } from 'nestjs-pino';
 import { AppModule } from './app.module';
 
 async function bootstrap() {
@@ -20,13 +22,15 @@ async function bootstrap() {
         queueOptions: { durable: true },
         noAck: false, // manual ack — see NotificationsController
       },
+      bufferLogs: true,
     },
   );
 
+  app.useLogger(app.get(Logger));
+
   await app.listen();
-  // eslint-disable-next-line no-console
-  console.log(
-    '📬 notifications-service listening on RabbitMQ queue "reservations_events_queue"',
+  new NestLogger('Bootstrap').log(
+    'notifications-service listening on RabbitMQ queue "reservations_events_queue"',
   );
 }
 bootstrap();

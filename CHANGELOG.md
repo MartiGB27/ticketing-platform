@@ -138,6 +138,9 @@ Redis and RabbitMQ go from provisioned-but-unused to load-bearing.
 ### Verified (real integration testing, not just unit-level)
 - Full hold → confirm → RabbitMQ → notifications-service → dry-run email
   flow, end to end.
+- **Real email delivery via Resend**: confirmed against a live account —
+  `ResendEmailProvider`'s HTTP call succeeds and the confirmation email
+  actually arrives in the recipient's inbox, not just the dry-run path.
 - Idempotency, all three cases with real concurrent `curl` requests:
   fresh key (processes normally), same key replayed after completion
   (returns cached result, zero reprocessing — confirmed via consumer log
@@ -159,14 +162,53 @@ Redis and RabbitMQ go from provisioned-but-unused to load-bearing.
 
 ### Known limitations (by design — addressed in later phases)
 - No structured JSON logging yet — still default Nest console logging.
-- **Real email delivery via Resend**: confirmed against a live account —
-  `ResendEmailProvider`'s HTTP call succeeds and the confirmation email
-  actually arrives in the recipient's inbox, not just the dry-run path.
 
 ---
 
-## [Unreleased] - Phase 4 (planned)
+## [Phase 4] - The Bow
 
-- Structured JSON logging across all 5 services.
-- Full architecture diagram.
-- Exported Postman collection (already tracked here each phase).
+No new features — this phase makes the existing system legible to
+someone who didn't build it.
+
+### Added
+- **Structured JSON logging** in all 4 NestJS services via
+  `nestjs-pino`: `LoggerModule.forRoot()` in `app.module.ts` +
+  `app.useLogger(app.get(Logger))` in `main.ts`. Zero changes needed to
+  any of the ~15 files that already had `new Logger(ClassName.name)`
+  calls — Nest's `Logger` delegates output to whatever app-wide logger
+  is configured, so every existing call site got JSON for free.
+- **Request-id correlation across services**: the Gateway generates (or
+  reuses) an `x-request-id` and forwards it downstream; each service's
+  `pinoHttp.genReqId` picks up that same id instead of minting its own.
+- **Redaction**: `redact: ['req.headers.authorization']` in every
+  service, so a JWT never lands in aggregated logs even though
+  `pino-http`'s automatic request logging captures headers by default.
+- **Gateway logging**: a small hand-rolled JSON access-log middleware
+  (method, path, status, duration, request id) — no `pino` dependency
+  added to the Gateway for one log line; it stays a thin Express app.
+- `docs/architecture.svg`: a self-contained architecture diagram (no
+  external stylesheet dependency, respects OS light/dark mode), embedded
+  in the root `README.md`.
+
+### Verified (real, not just unit-level)
+- All 5 services confirmed producing structured JSON on startup and per
+  request.
+- Cross-service correlation confirmed by hand: sent a request through
+  the Gateway with a specific `x-request-id`, then grepped that id
+  across both the Gateway's and the downstream service's logs and found
+  the same id tying both log lines to the one request.
+- Redaction confirmed: sent a request with a real-looking
+  `Authorization: Bearer ...` header and verified the logged value reads
+  literally `"[Redacted]"`, never the token itself.
+- `useLogger()` confirmed working in a pure `createMicroservice()`
+  context too (notifications-service has no HTTP server at all) — not
+  assumed just because it works for the HTTP services.
+- Full reservation flow (register → login → event → hold → confirm →
+  notification) re-run end to end after all logging changes, to confirm
+  nothing about the actual application behavior regressed.
+
+---
+
+*Four phases, one `main` branch, no `phase1/`/`phase2/`/`phase3/`/`phase4/`
+folders. See the Releases page for the same story as clickable,
+browsable tags.*

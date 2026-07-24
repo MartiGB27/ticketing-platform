@@ -3,18 +3,29 @@ import express, { Request, Response, NextFunction } from 'express';
 import { createProxyMiddleware } from 'http-proxy-middleware';
 import { buildRouteTargets, resolveTarget } from './routes';
 import { createJwtPrecheckMiddleware } from './jwt-precheck.middleware';
+import { requestLoggingMiddleware } from './request-logging.middleware';
 
 const PORT = process.env.PORT ?? 3000;
 const JWT_SECRET = process.env.JWT_SECRET;
 
 if (!JWT_SECRET) {
-  // eslint-disable-next-line no-console
-  console.error('Missing JWT_SECRET environment variable. Refusing to start.');
+  console.log(
+    JSON.stringify({
+      level: 'error',
+      time: new Date().toISOString(),
+      service: 'gateway',
+      msg: 'Missing JWT_SECRET environment variable. Refusing to start.',
+    }),
+  );
   process.exit(1);
 }
 
 const routes = buildRouteTargets();
 const app = express();
+
+// First middleware of all: every request gets a request id and gets
+// logged, including the health check and 404s below.
+app.use(requestLoggingMiddleware);
 
 // Simple liveness check for the gateway itself (useful for a Docker
 // healthcheck later on). Placed before everything else, unauthenticated.
@@ -49,8 +60,15 @@ app.use(
     changeOrigin: true,
     on: {
       error: (err, _req, res) => {
-        // eslint-disable-next-line no-console
-        console.error('Proxy error:', err.message);
+        console.log(
+          JSON.stringify({
+            level: 'error',
+            time: new Date().toISOString(),
+            service: 'gateway',
+            msg: 'Proxy error',
+            error: err.message,
+          }),
+        );
         const response = res as Response;
         if (!response.headersSent) {
           response
@@ -63,10 +81,13 @@ app.use(
 );
 
 app.listen(PORT, () => {
-  // eslint-disable-next-line no-console
-  console.log(`🚪 gateway listening on http://localhost:${PORT}`);
-  routes.forEach((route) => {
-    // eslint-disable-next-line no-console
-    console.log(`   ${route.prefix} -> ${route.target}`);
-  });
+  console.log(
+    JSON.stringify({
+      level: 'info',
+      time: new Date().toISOString(),
+      service: 'gateway',
+      msg: `gateway listening on port ${PORT}`,
+      routes: routes.map((r) => ({ prefix: r.prefix, target: r.target })),
+    }),
+  );
 });
